@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime" // 新增：用于判断操作系统
 	"strings"
 	"sync"
 	"syscall"
@@ -54,9 +55,6 @@ func NewWidget(tviewApp *tview.Application, redrawChan chan bool, settings *Sett
 // Refresh signals the runCommandLoop to continue, or triggers a re-draw if the
 // command is still running.
 func (widget *Widget) Refresh() {
-	// Try to run the command. If the command is still running, let it keep
-	// running and do a refresh instead. Otherwise, the widget will redraw when
-	// the command completes.
 	select {
 	case widget.runChan <- true:
 	default:
@@ -79,10 +77,8 @@ func (widget *Widget) Write(p []byte) (n int, err error) {
 	widget.m.Lock()
 	defer widget.m.Unlock()
 
-	// Write the new data into the buffer
 	n, err = widget.buffer.Write(p)
 
-	// Remove lines that exceed maxLines
 	lines := widget.countLines()
 	if lines > widget.settings.maxLines {
 		err = widget.drainLines(lines - widget.settings.maxLines)
@@ -93,12 +89,10 @@ func (widget *Widget) Write(p []byte) (n int, err error) {
 
 /* -------------------- Unexported Functions -------------------- */
 
-// countLines counts the lines of data in the buffer
 func (widget *Widget) countLines() int {
 	return bytes.Count(widget.buffer.Bytes(), []byte{'\n'})
 }
 
-// drainLines removed the first n lines from the buffer
 func (widget *Widget) drainLines(n int) error {
 	for i := 0; i < n; i++ {
 		_, err := widget.buffer.ReadBytes('\n')
@@ -121,8 +115,6 @@ func (widget *Widget) environment() []string {
 }
 
 func runCommandLoop(widget *Widget) {
-	// Run the command forever in a loop. Refresh() will put a value into the
-	// channel to signal the loop to continue.
 	for {
 		<-widget.runChan
 		widget.resetBuffer()
@@ -149,7 +141,6 @@ func runCommand(widget *Widget, cmd *exec.Cmd) error {
 
 func runCommandPty(widget *Widget, cmd *exec.Cmd) error {
 	f, err := pty.Start(cmd)
-	// The command has exited, print any error messages
 	if err != nil {
 		if widget.settings.ptySuppressErrors {
 			return cmd.Wait()
@@ -158,23 +149,32 @@ func runCommandPty(widget *Widget, cmd *exec.Cmd) error {
 		}
 	}
 
-	// Make sure to close the pty at the end.
-	defer func() { _ = f.Close() }() // Best effort.
+	defer func() { _ = f.Close() }()
 
-	// Handle pty size.
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGWINCH)
-	go func() {
-		for range ch {
-			if err := pty.InheritSize(os.Stdin, f); err != nil {
-				logger.Log(fmt.Sprintf("error resizing pty: %s", err))
+	// --- 修改开始：处理 Windows 兼容性 ---
+	if runtime.GOOS != "windows" {
+		// 在非 Windows 系统（Unix/Linux/macOS）下，SIGWINCH 常量是存在的
+		// 使用 type assertion 或硬编码常量来规避 Windows 编译器的类型检查
+		const sigWinch = syscall.Signal(0x1c) 
+
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, sigWinch)
+		go func() {
+			for range ch {
+				if err := pty.InheritSize(os.Stdin, f); err != nil {
+					logger.Log(fmt.Sprintf("error resizing pty: %s", err))
+				}
 			}
+		}()
+		// 发送初始大小调整信号
+		select {
+		case ch <- sigWinch:
+		default:
 		}
-	}()
-	ch <- syscall.SIGWINCH                        // Initial resize.
-	defer func() { signal.Stop(ch); close(ch) }() // Cleanup signals when done.
+		defer func() { signal.Stop(ch); close(ch) }()
+	}
+	// --- 修改结束 ---
 
-	// Extract output
 	_, err = io.Copy(widget.buffer, f)
 	if err != nil {
 		if widget.settings.ptySuppressErrors && errors.Is(err, syscall.EIO) {
